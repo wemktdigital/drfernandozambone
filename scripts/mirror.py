@@ -20,6 +20,7 @@ SKIP_PARTS = ("/wp-admin/", "/wp-json", "/xmlrpc.php", "/feed", "/comments/")
 ASSET_EXT = (
     ".css", ".js", ".mjs", ".json", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg",
     ".woff", ".woff2", ".ttf", ".eot", ".ico", ".avif", ".mp4", ".webm",
+    ".mp3", ".m4a", ".wav", ".ogg", ".pdf",
 )
 BROWSER_UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -196,6 +197,8 @@ def strip_origin(text: str) -> str:
         for scheme in ("https", "http"):
             escaped = scheme + ":\\/\\/" + host
             plain = scheme + "://" + host
+            text = text.replace(plain + "//", "/")
+            text = text.replace(escaped + "\\/\\/", "\\/")
             text = text.replace(escaped + "\\/", "\\/")
             text = text.replace(escaped, "\\/")
             text = text.replace(plain + "/", "/")
@@ -255,6 +258,7 @@ def replace_page_title(html: str) -> str:
 
 def rewrite_html(html: str) -> str:
     html = replace_page_title(html)
+    original_canonical = re.search(r'<link rel="canonical" href="([^"]*)"', html, flags=re.I)
     html = strip_origin(html)
     html = re.sub(r"<link[^>]+(?:xmlrpc\.php|/wp-json/|/feed/)[^>]*>", "", html, flags=re.I)
     html = re.sub(
@@ -263,6 +267,14 @@ def rewrite_html(html: str) -> str:
         html,
         flags=re.I,
     )
+    if original_canonical and original_canonical.group(1).rstrip("/") == ORIGIN:
+        html = re.sub(
+            r'(<link rel="canonical" href=")[^"]*',
+            lambda match: match.group(1) + original_canonical.group(1),
+            html,
+            count=1,
+            flags=re.I,
+        )
     html = OLD_SERVER.sub("", html)
     html = re.sub(
         r'<script\b[^>]*\bsrc="https://cdn\.trustindex\.io/loader\.js[^"]*"[^>]*>\s*</script>',
@@ -322,13 +334,14 @@ def restore_public_urls(html: str) -> str:
     html = re.sub(r'<meta name="twitter:image" content="([^"]*)"', twitter, html)
 
     def schema(match: re.Match) -> str:
-        block = match.group(0)
-        return block.replace('"/', f'"{ORIGIN}/')
+        block = re.sub(r'"/(?!/)', f'"{ORIGIN}/', match.group(0))
+        return re.sub(r'"\\/(?!\\/)', '"' + ORIGIN.replace("/", "\\/") + "\\/", block)
 
     return re.sub(
-        r'<script type="application/ld\+json" class="rank-math-schema">[\s\S]*?</script>',
+        r'<script\b[^>]*type=["\']application/ld\+json["\'][^>]*>[\s\S]*?</script>',
         schema,
         html,
+        flags=re.I,
     )
 
 
@@ -401,11 +414,55 @@ def remember_page(page: str, into_sitemap: bool, captured: list, queue: list, ex
     if final_host and final_host not in HOSTS:
         flags.append(f"redirecionou para fora: {page} -> {final}")
         return
+    asked = urllib.parse.urlparse(page).path or "/"
+    landed = urllib.parse.urlparse(final).path or "/"
+    if not landed.endswith("/") and "." not in landed.rsplit("/", 1)[-1]:
+        landed += "/"
+    if asked != landed:
+        REDIRECTS[asked] = landed
+        if landed in SEEN_FINALS:
+            return
+        into_sitemap = False
+    if landed in SEEN_FINALS:
+        return
+    SEEN_FINALS.add(landed)
     html = data.decode("utf-8", "replace")
     if SUSPICIOUS.search(html):
         flags.append(f"html suspeito: {final}")
     captured.append((final, html, into_sitemap))
     queue_found_urls(html, final, queue, extra_pages, seen_pages)
+
+
+REDIRECTS: dict[str, str] = {}
+SEEN_FINALS: set[str] = set()
+
+
+def write_redirects(flags: list) -> None:
+    if not REDIRECTS:
+        return
+    rules = []
+    for source, destination in sorted(REDIRECTS.items()):
+        if source == destination:
+            continue
+        rules.append({"source": source, "destination": destination, "permanent": True})
+        stub = PUBLIC / source.lstrip("/") / "index.html"
+        if stub.exists():
+            continue
+        stub.parent.mkdir(parents=True, exist_ok=True)
+        stub.write_text(
+            "<!doctype html><html><head><meta charset=\"utf-8\">"
+            f"<link rel=\"canonical\" href=\"{ORIGIN}{destination}\">"
+            f"<meta http-equiv=\"refresh\" content=\"0; url={destination}\">"
+            "<meta name=\"robots\" content=\"noindex\">"
+            f"</head><body><a href=\"{destination}\">{destination}</a></body></html>\n",
+            encoding="utf-8",
+        )
+    config_path = ROOT / "vercel.json"
+    config = json.loads(config_path.read_text()) if config_path.exists() else {}
+    config["trailingSlash"] = True
+    config["redirects"] = rules
+    config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    flags.append(f"redirecionamentos do WordPress mantidos: {len(rules)}")
 
 
 def main() -> None:
@@ -458,6 +515,8 @@ def main() -> None:
                 flags.append(f"paginacao noindex, fora do sitemap: {final}")
             else:
                 pages.append(final if final.endswith("/") else final + "/")
+    pages = [page for page in pages if (urllib.parse.urlparse(page).path or "/") not in REDIRECTS]
+    write_redirects(flags)
 
     assets = 0
     while queue:
@@ -501,10 +560,14 @@ def main() -> None:
             print(f"assets {assets}", flush=True)
 
     locs = []
+    listed = set()
     for page in pages:
         path = urllib.parse.urlparse(page).path or "/"
         if not path.endswith("/"):
             path += "/"
+        if path in listed:
+            continue
+        listed.add(path)
         locs.append(f"  <url><loc>{ORIGIN}{path}</loc></url>")
     sitemap = (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
